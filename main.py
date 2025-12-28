@@ -1,83 +1,148 @@
-# book_scraper.py
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 import csv
+import time
+import os
+import re
 
-def scrape_book_data(url):
-        response = requests.get(url)
-        response.raise_for_status()  
-        soup = BeautifulSoup(response.text, 'html.parser')
+BASE_URL = "https://books.toscrape.com/"
 
-        # Extract book information
-        product_page_url = url
-        book_title = soup.find('div', class_='product_main').h1.text.strip()
-        upc = soup.find('th', text='UPC').find_next_sibling('td').text.strip()
-        price_including_tax = soup.find('th', text='Price (incl. tax)').find_next_sibling('td').text.strip()
-        price_excluding_tax = soup.find('th', text='Price (excl. tax)').find_next_sibling('td').text.strip()
-        availability_text = soup.find('th', text='Availability').find_next_sibling('td').text.strip()
-        quantity_available = ''.join([c for c in availability_text if c.isdigit()]) or "0"
+def get_soup(url):
+    resp = requests.get(url)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "html.parser")
 
-        # Description
-        description_tag = soup.find('div', id='product_description')
-        if description_tag:
-            product_description = description_tag.find_next('p').text.strip()
-        else:
-            product_description = "No description available."
+def scrape_book(book_url):
+    soup = get_soup(book_url)
 
-        # Category
-        category = soup.find('ul', class_='breadcrumb').find_all('a')[2].text.strip()
+    title = soup.find("h1").get_text(strip=True)
 
-        # Review rating
-        rating_tag = soup.find('p', class_='star-rating')
-        review_rating = rating_tag['class'][1] if rating_tag else "No rating"
+    table = soup.find("table", class_="table-striped")
+    info = {row.find("th").get_text(strip=True): row.find("td").get_text(strip=True) 
+            for row in table.find_all("tr")}
 
-        # Image URL (make absolute)
-        image_url = soup.find('div', class_='item active').img['src']
-        image_url = "https://books.toscrape.com/" + image_url.replace('../', '')
+    upc = info.get("UPC", "")
+    price_excl = info.get("Price (excl. tax)", "")
+    price_incl = info.get("Price (incl. tax)", "")
+    availability = info.get("Availability", "")
+    qty_match = re.search(r"\((\d+) available\)", availability)
+    quantity = qty_match.group(1) if qty_match else availability
 
-        # Return all data as a dictionary
-        return {
-            "product_page_url": product_page_url,
-            "universal_product_code": upc,
-            "book_title": book_title,
-            "price_including_tax": price_including_tax,
-            "price_excluding_tax": price_excluding_tax,
-            "quantity_available": quantity_available,
-            "product_description": product_description,
-            "category": category,
-            "review_rating": review_rating,
-            "image_url": image_url
-        }
+    description = ""
+    desc_div = soup.find("div", id="product_description")
+    if desc_div:
+        p = desc_div.find_next_sibling("p")
+        description = p.get_text(strip=True) if p else ""
 
+    category = ""
+    breadcrumb = soup.find("ul", class_="breadcrumb")
+    if breadcrumb:
+        crumbs = breadcrumb.find_all("li")
+        if len(crumbs) >= 3:
+            category = crumbs[-2].get_text(strip=True)
+
+
+    rating = ""
+    rating_p = soup.find("p", class_=re.compile("star-rating"))
+    if rating_p:
+        for c in rating_p.get("class", []):
+            if c != "star-rating":
+                rating = c
+    img_tag = soup.find("div", class_="item active").find("img")
+    image_url = ""
+    if img_tag and img_tag.has_attr("src"):
+        image_url = urljoin(book_url, img_tag["src"])
+
+    return {
+        "product_page_url": book_url,
+        "universal_product_code": upc,
+        "book_title": title,
+        "price_including_tax": price_incl,
+        "price_excluding_tax": price_excl,
+        "quantity_available": quantity,
+        "product_description": description,
+        "category": category,
+        "review_rating": rating,
+        "image_url": image_url,
+    }
+
+def download_image(image_url, save_path):
+    try:
+        resp = requests.get(image_url, stream=True, timeout=10)
+        resp.raise_for_status()
+        with open(save_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024):
+                if chunk:
+                    f.write(chunk)
     except Exception as e:
-        print(f"❌ Error scraping book: {e}")
-        return None
+        print(f"Failed to download image {image_url}: {e}")
 
+def get_all_categories():
+    soup = get_soup(BASE_URL)
+    side = soup.find("div", class_="side_categories")
+    categories = {}
+    for a in side.find_all("a"):
+        name = a.get_text(strip=True)
+        href = a.get("href")
+        full_url = urljoin(BASE_URL, href)
+        categories[name] = full_url
+    return categories
 
-def save_to_csv(data, filename="book_data.csv"):
-    """Write the scraped data to a CSV file."""
-    if not data:
-        print("⚠️ No data to save.")
+def scrape_category(cat_name, cat_url):
+    books = []
+    next_page = cat_url
+    safe_cat = re.sub(r"[^A-Za-z0-9_]", "_", cat_name)
+
+    while next_page:
+        print("Scraping", cat_name, next_page)
+        soup = get_soup(next_page)
+        for art in soup.find_all("article", class_="product_pod"):
+            a = art.find("h3").find("a")
+            href = a.get("href")
+            book_url = urljoin(next_page, href)
+            book_data = scrape_book(book_url)
+            books.append(book_data)
+
+            img_url = book_data["image_url"]
+            if img_url:
+                cat_folder = os.path.join("images", safe_cat)
+                os.makedirs(cat_folder, exist_ok=True)
+                img_filename = f"{book_data['universal_product_code']}.jpg"
+                img_path = os.path.join(cat_folder, img_filename)
+                download_image(img_url, img_path)
+
+            time.sleep(0.5)  
+
+        nxt = soup.find("li", class_="next")
+        if nxt and nxt.find("a"):
+            next_href = nxt.find("a")["href"]
+            next_page = urljoin(next_page, next_href)
+        else:
+            next_page = None
+
+        time.sleep(1) 
+    return books
+
+def save_books_to_csv(books, cat_name, output_folder="category_data"):
+    if not books:
         return
-
-    fieldnames = [
-        "product_page_url", "universal_product_code", "book_title",
-        "price_including_tax", "price_excluding_tax", "quantity_available",
-        "product_description", "category", "review_rating", "image_url"
-    ]
-
-    with open(filename, mode='w', newline='', encoding='utf-8') as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
+    os.makedirs(output_folder, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9_]", "_", cat_name)
+    filename = os.path.join(output_folder, f"{safe_name}.csv")
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=books[0].keys())
         writer.writeheader()
-        writer.writerow(data)
+        for b in books:
+            writer.writerow(b)
+    print(f"Saved {len(books)} books to {filename}")
 
+def main():
+    categories = get_all_categories()
+    categories.pop("Books", None)
+    for name, url in categories.items():
+        books = scrape_category(name, url)
+        save_books_to_csv(books, name)
 
 if __name__ == "__main__":
-    # Example single book URL from Books to Scrape
-    book_url = "https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html"
-    print("🔍 Scraping book data...")
-
-    book_data = scrape_book_data(book_url)
-    save_to_csv(book_data)
-
- 
+    main()
