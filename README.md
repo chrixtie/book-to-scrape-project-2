@@ -4,7 +4,7 @@
 Clone the repository
 First, copy the project to your local computer using Git.
 
-git clone https://github.com/chrixtie/book-to-scrape-project-2
+git https://github.com/chrixtie/book-to-scrape-project-2
 
 
 Create a Python environment
